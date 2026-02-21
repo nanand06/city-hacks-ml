@@ -74,6 +74,205 @@ function sidewalkConditionBadgeTone(value) {
   return 'neutral'
 }
 
+function vulnerabilityColor(score) {
+  const v = Number(score)
+  if (!Number.isFinite(v)) return '#1e3a8a'
+  if (v >= 0.66) return '#7f1d1d'
+  if (v >= 0.33) return '#6d28d9'
+  return '#1e3a8a'
+}
+
+function roundedCoord(value) {
+  return Number(value).toFixed(6)
+}
+
+function getSegmentEndpoints(feature) {
+  const chains = getLineChains(feature?.geometry)
+  if (!chains.length) return []
+  const endpoints = []
+  for (const chain of chains) {
+    if (!Array.isArray(chain) || chain.length === 0) continue
+    const first = chain[0]
+    const last = chain[chain.length - 1]
+    if (Array.isArray(first) && first.length >= 2) endpoints.push(`${roundedCoord(first[1])},${roundedCoord(first[0])}`)
+    if (Array.isArray(last) && last.length >= 2) endpoints.push(`${roundedCoord(last[1])},${roundedCoord(last[0])}`)
+  }
+  return endpoints
+}
+
+function computeLocalNetworkVulnerability(roadFeatures) {
+  const ids = []
+  const pciById = {}
+  const endpointMap = new Map()
+
+  for (const feature of roadFeatures || []) {
+    const sid = getRoadSegmentId(feature?.properties || {})
+    const pci = Number(feature?.properties?.score)
+    if (!sid || !Number.isFinite(pci)) continue
+    ids.push(sid)
+    pciById[sid] = pci
+    for (const endpoint of getSegmentEndpoints(feature)) {
+      if (!endpointMap.has(endpoint)) endpointMap.set(endpoint, new Set())
+      endpointMap.get(endpoint).add(sid)
+    }
+  }
+
+  const neighbors = {}
+  for (const id of ids) neighbors[id] = new Set()
+  for (const setOfIds of endpointMap.values()) {
+    const list = [...setOfIds]
+    for (let i = 0; i < list.length; i += 1) {
+      for (let j = i + 1; j < list.length; j += 1) {
+        neighbors[list[i]].add(list[j])
+        neighbors[list[j]].add(list[i])
+      }
+    }
+  }
+
+  const vulnerabilityById = {}
+  for (const id of ids) {
+    const normalizedPci = Math.max(0, Math.min(1, pciById[id] / 100))
+    const nIds = [...neighbors[id]]
+    const avgNeighborRisk = nIds.length
+      ? nIds.reduce((sum, nId) => sum + (1 - Math.max(0, Math.min(1, pciById[nId] / 100))), 0) / nIds.length
+      : 0
+    const score = 0.6 * (1 - normalizedPci) + 0.4 * avgNeighborRisk
+    vulnerabilityById[id] = Math.max(0, Math.min(1, score))
+  }
+
+  const highRisk = new Set(ids.filter((id) => vulnerabilityById[id] > 0.6))
+  const clusterById = {}
+  const clusterMeta = {}
+  let clusterId = 0
+
+  for (const id of ids) {
+    if (clusterById[id] !== undefined) continue
+    if (!highRisk.has(id)) {
+      clusterById[id] = null
+      continue
+    }
+    clusterId += 1
+    const queue = [id]
+    const members = []
+    clusterById[id] = clusterId
+    while (queue.length) {
+      const current = queue.shift()
+      members.push(current)
+      for (const nId of neighbors[current]) {
+        if (!highRisk.has(nId) || clusterById[nId] !== undefined) continue
+        clusterById[nId] = clusterId
+        queue.push(nId)
+      }
+    }
+    const avgPci = members.reduce((sum, m) => sum + pciById[m], 0) / Math.max(1, members.length)
+    clusterMeta[String(clusterId)] = { clusterSize: members.length, avgClusterPci: avgPci }
+  }
+
+  const rows = {}
+  for (const id of ids) {
+    const cid = clusterById[id]
+    const meta = cid ? clusterMeta[String(cid)] : { clusterSize: 0, avgClusterPci: 0 }
+    rows[id] = {
+      segment_id: id,
+      vulnerability_score: vulnerabilityById[id],
+      cluster_id: cid,
+      cluster_size: meta.clusterSize,
+      avg_cluster_pci: meta.avgClusterPci
+    }
+  }
+  return { rows, clusterMeta }
+}
+
+function sidewalkConditionRiskFromProps(props) {
+  const key = sidewalkBucketKey(props?.condition || props?.Condition)
+  if (key === 'poor') return 0.82
+  if (key === 'fair') return 0.5
+  if (key === 'good') return 0.2
+  return 0.45
+}
+
+function computeLocalSidewalkVulnerability(sidewalkFeatures) {
+  const ids = []
+  const riskById = {}
+  const endpointMap = new Map()
+
+  for (const feature of sidewalkFeatures || []) {
+    const sid = getSidewalkSegmentId(feature?.properties || {})
+    if (!sid) continue
+    ids.push(sid)
+    riskById[sid] = sidewalkConditionRiskFromProps(feature?.properties || {})
+    for (const endpoint of getSegmentEndpoints(feature)) {
+      if (!endpointMap.has(endpoint)) endpointMap.set(endpoint, new Set())
+      endpointMap.get(endpoint).add(sid)
+    }
+  }
+
+  const neighbors = {}
+  for (const id of ids) neighbors[id] = new Set()
+  for (const setOfIds of endpointMap.values()) {
+    const list = [...setOfIds]
+    for (let i = 0; i < list.length; i += 1) {
+      for (let j = i + 1; j < list.length; j += 1) {
+        neighbors[list[i]].add(list[j])
+        neighbors[list[j]].add(list[i])
+      }
+    }
+  }
+
+  const vulnerabilityById = {}
+  for (const id of ids) {
+    const ownRisk = riskById[id]
+    const nIds = [...neighbors[id]]
+    const avgNeighborRisk = nIds.length
+      ? nIds.reduce((sum, nId) => sum + (riskById[nId] ?? 0), 0) / nIds.length
+      : ownRisk
+    const score = 0.6 * ownRisk + 0.4 * avgNeighborRisk
+    vulnerabilityById[id] = Math.max(0, Math.min(1, score))
+  }
+
+  const highRisk = new Set(ids.filter((id) => vulnerabilityById[id] > 0.6))
+  const clusterById = {}
+  const clusterMeta = {}
+  let clusterId = 0
+
+  for (const id of ids) {
+    if (clusterById[id] !== undefined) continue
+    if (!highRisk.has(id)) {
+      clusterById[id] = null
+      continue
+    }
+    clusterId += 1
+    const queue = [id]
+    const members = []
+    clusterById[id] = clusterId
+    while (queue.length) {
+      const current = queue.shift()
+      members.push(current)
+      for (const nId of neighbors[current]) {
+        if (!highRisk.has(nId) || clusterById[nId] !== undefined) continue
+        clusterById[nId] = clusterId
+        queue.push(nId)
+      }
+    }
+    const avgRisk = members.reduce((sum, m) => sum + vulnerabilityById[m], 0) / Math.max(1, members.length)
+    clusterMeta[String(clusterId)] = { clusterSize: members.length, avgClusterPci: avgRisk * 100 }
+  }
+
+  const rows = {}
+  for (const id of ids) {
+    const cid = clusterById[id]
+    const meta = cid ? clusterMeta[String(cid)] : { clusterSize: 0, avgClusterPci: 0 }
+    rows[id] = {
+      segment_id: id,
+      vulnerability_score: vulnerabilityById[id],
+      cluster_id: cid,
+      cluster_size: meta.clusterSize,
+      avg_cluster_pci: meta.avgClusterPci
+    }
+  }
+  return { rows, clusterMeta }
+}
+
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const toRad = (d) => (d * Math.PI) / 180
   const R = 6371000
@@ -287,6 +486,9 @@ export default function App() {
     fair: true,
     poor: true
   })
+  const [showNetworkVulnerability, setShowNetworkVulnerability] = useState(false)
+  const [vulnerabilityBySegmentId, setVulnerabilityBySegmentId] = useState({})
+  const [vulnerabilityClusterMeta, setVulnerabilityClusterMeta] = useState({})
 
   const geoJsonRef = useRef(null)
   const suppressMapClearRef = useRef(false)
@@ -348,6 +550,44 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (!showNetworkVulnerability || viewMode !== 'roads') return
+    let cancelled = false
+    async function loadNetworkVulnerability() {
+      try {
+        const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+        const res = await fetch(`${apiBase}/network-vulnerability`)
+        if (!res.ok) throw new Error(`network-vulnerability failed (${res.status})`)
+        const rows = await res.json()
+        if (cancelled || !Array.isArray(rows)) return
+        const map = {}
+        const clusterMap = {}
+        for (const row of rows) {
+          const sid = String(row.segment_id ?? '')
+          if (!sid) continue
+          map[sid] = row
+          if (row.cluster_id !== null && row.cluster_id !== undefined) {
+            clusterMap[String(row.cluster_id)] = {
+              clusterSize: row.cluster_size ?? 0,
+              avgClusterPci: Number(row.avg_cluster_pci ?? row.cluster_avg_pci ?? 0)
+            }
+          }
+        }
+        setVulnerabilityBySegmentId(map)
+        setVulnerabilityClusterMeta(clusterMap)
+      } catch (_e) {
+        if (!cancelled) {
+          setVulnerabilityBySegmentId({})
+          setVulnerabilityClusterMeta({})
+        }
+      }
+    }
+    loadNetworkVulnerability()
+    return () => {
+      cancelled = true
+    }
+  }, [showNetworkVulnerability, viewMode])
+
+  useEffect(() => {
     if (!isResizingSidebar) return
 
     const onMouseMove = (e) => {
@@ -385,6 +625,34 @@ export default function App() {
 
   const activeData = useMemo(() => (viewMode === 'roads' ? rollupData : sidewalkData), [viewMode, rollupData, sidewalkData])
   const allFeatures = useMemo(() => activeData?.features || [], [activeData])
+  const localVulnerability = useMemo(
+    () => computeLocalNetworkVulnerability(rollupData?.features || []),
+    [rollupData]
+  )
+  const localSidewalkVulnerability = useMemo(
+    () => computeLocalSidewalkVulnerability(sidewalkData?.features || []),
+    [sidewalkData]
+  )
+  const effectiveRoadVulnerabilityBySegmentId = useMemo(() => {
+    const backendEntries = Object.entries(vulnerabilityBySegmentId || {})
+    if (backendEntries.length === 0) return localVulnerability.rows
+    const backendKeys = new Set(backendEntries.map(([k]) => k))
+    const localKeys = Object.keys(localVulnerability.rows)
+    const matched = localKeys.filter((k) => backendKeys.has(k)).length
+    if (matched === 0) return localVulnerability.rows
+    const merged = { ...localVulnerability.rows }
+    for (const [k, row] of backendEntries) merged[k] = row
+    return merged
+  }, [vulnerabilityBySegmentId, localVulnerability])
+  const effectiveVulnerabilityBySegmentId = useMemo(() => {
+    return viewMode === 'roads' ? effectiveRoadVulnerabilityBySegmentId : localSidewalkVulnerability.rows
+  }, [viewMode, effectiveRoadVulnerabilityBySegmentId, localSidewalkVulnerability])
+  const effectiveVulnerabilityClusterMeta = useMemo(() => {
+    if (viewMode === 'roads') {
+      return { ...localVulnerability.clusterMeta, ...vulnerabilityClusterMeta }
+    }
+    return localSidewalkVulnerability.clusterMeta
+  }, [viewMode, localVulnerability, vulnerabilityClusterMeta, localSidewalkVulnerability])
 
   const legendItems = useMemo(() => {
     if (viewMode === 'roads') {
@@ -506,6 +774,10 @@ export default function App() {
   }, [allFeatures, viewMode])
 
   const selectedSegmentId = selectedSegment?.id || ''
+  const selectedNetworkVulnerability = useMemo(() => {
+    if (!selectedSegment) return null
+    return effectiveVulnerabilityBySegmentId[String(selectedSegment.rawId)] || null
+  }, [selectedSegment, effectiveVulnerabilityBySegmentId])
 
   const styleFeature = (feature) => {
     const p = feature?.properties || {}
@@ -520,6 +792,35 @@ export default function App() {
       color,
       weight: isSelected ? 8 : 6,
       opacity: isSelected ? 1 : 0.9,
+      lineCap: 'round',
+      lineJoin: 'round'
+    }
+  }
+
+  const vulnerabilityOverlayGeoJson = useMemo(() => {
+    if (!showNetworkVulnerability || !visibleGeoJson) return null
+    const features = (visibleGeoJson.features || []).filter((f) => {
+      const sid = viewMode === 'roads'
+        ? getRoadSegmentId(f?.properties || {})
+        : getSidewalkSegmentId(f?.properties || {})
+      return Boolean(effectiveVulnerabilityBySegmentId[sid])
+    })
+    if (features.length === 0) return null
+    return { ...visibleGeoJson, features }
+  }, [showNetworkVulnerability, viewMode, visibleGeoJson, effectiveVulnerabilityBySegmentId])
+
+  const vulnerabilityOverlayStyle = (feature) => {
+    const sid = viewMode === 'roads'
+      ? getRoadSegmentId(feature?.properties || {})
+      : getSidewalkSegmentId(feature?.properties || {})
+    const vuln = effectiveVulnerabilityBySegmentId[sid]
+    const score = Number(vuln?.vulnerability_score)
+    const overlayOpacity = score >= 0.66 ? 0.72 : score >= 0.33 ? 0.58 : 0.46
+    return {
+      color: vulnerabilityColor(score),
+      weight: 10,
+      opacity: overlayOpacity,
+      dashArray: score >= 0.66 ? '8 6' : undefined,
       lineCap: 'round',
       lineJoin: 'round'
     }
@@ -674,6 +975,21 @@ export default function App() {
               <div className="helper-inline-text">
                 Tap legend items to show/hide categories.
               </div>
+              {(viewMode === 'roads' || viewMode === 'sidewalks') && (
+                <label className="network-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={showNetworkVulnerability}
+                    onChange={(e) => setShowNetworkVulnerability(e.target.checked)}
+                  />
+                  <span>Show Network Vulnerability</span>
+                </label>
+              )}
+              {showNetworkVulnerability && (
+                <div className="helper-inline-text">
+                  Tip: enable lower-risk legend categories (for example "Good") to reveal more low-vulnerability segments.
+                </div>
+              )}
             </div>
 
             <div className="panel selected-inline-panel">
@@ -710,6 +1026,14 @@ export default function App() {
                       <div className="overlay-metric-label">PCI Score</div>
                       <div className="overlay-metric-value">{formatScore(selectedSegment.score)}</div>
                     </div>
+                    <div className="overlay-metric">
+                      <div className="overlay-metric-label">Network Vulnerability</div>
+                      <div className="overlay-metric-value">
+                        {selectedNetworkVulnerability
+                          ? `${Number(selectedNetworkVulnerability.vulnerability_score).toFixed(2)} / 1.00`
+                          : 'N/A'}
+                      </div>
+                    </div>
                     <div className="selected-pano-chip">
                       {selectedSegment.nearestPanorama
                         ? `${Math.round(selectedSegment.nearestPanorama.distanceMeters)} m to panorama`
@@ -742,6 +1066,22 @@ export default function App() {
                       <div className="detail-value">{selectedSegment.material || 'N/A'}</div>
                     </div>
 
+                    <div className="detail-item">
+                      <div className="detail-label">Network Vulnerability</div>
+                      <div className="detail-value">
+                        {selectedNetworkVulnerability
+                          ? `${Number(selectedNetworkVulnerability.vulnerability_score).toFixed(2)} / 1.00`
+                          : 'N/A'}
+                      </div>
+                    </div>
+
+                    <div className="detail-item">
+                      <div className="detail-label">Risk Cluster</div>
+                      <div className="detail-value">
+                        {selectedNetworkVulnerability?.cluster_id ?? 'N/A'}
+                      </div>
+                    </div>
+
                     <div className="detail-item span-2">
                       <div className="detail-label">Clicked Location</div>
                       <div className="detail-value mono">
@@ -751,6 +1091,47 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+
+                  <details className="network-intelligence" open>
+                    <summary>Network Intelligence</summary>
+                    {!selectedNetworkVulnerability && (
+                      <div className="network-intel-empty">No vulnerability result for this segment yet.</div>
+                    )}
+                    {selectedNetworkVulnerability && (
+                      <div className="detail-grid detail-grid-5">
+                        <div className="detail-item">
+                          <div className="detail-label">Vulnerability Score</div>
+                          <div className="detail-value">{`${Number(selectedNetworkVulnerability.vulnerability_score).toFixed(2)} / 1.00`}</div>
+                        </div>
+                        <div className="detail-item">
+                          <div className="detail-label">Cluster ID</div>
+                          <div className="detail-value">
+                            {selectedNetworkVulnerability.cluster_id ?? 'N/A'}
+                          </div>
+                        </div>
+                        <div className="detail-item">
+                          <div className="detail-label">Cluster Size</div>
+                          <div className="detail-value">
+                            {selectedNetworkVulnerability.cluster_size ??
+                              effectiveVulnerabilityClusterMeta[String(selectedNetworkVulnerability.cluster_id)]?.clusterSize ??
+                              0}{' '}
+                            segments
+                          </div>
+                        </div>
+                        <div className="detail-item">
+                          <div className="detail-label">Avg Cluster PCI</div>
+                          <div className="detail-value">
+                            {Number(
+                              selectedNetworkVulnerability.avg_cluster_pci ??
+                                selectedNetworkVulnerability.cluster_avg_pci ??
+                                effectiveVulnerabilityClusterMeta[String(selectedNetworkVulnerability.cluster_id)]?.avgClusterPci ??
+                                0
+                            ).toFixed(0)}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </details>
 
                   <div className="selected-footer">
                     {selectedSegment.nearestPanorama ? (
@@ -787,6 +1168,14 @@ export default function App() {
                       <div className="overlay-metric-label">Condition</div>
                       <div className="overlay-metric-value smaller">{selectedSegment.label}</div>
                     </div>
+                    <div className="overlay-metric">
+                      <div className="overlay-metric-label">Network Vulnerability</div>
+                      <div className="overlay-metric-value">
+                        {selectedNetworkVulnerability
+                          ? `${Number(selectedNetworkVulnerability.vulnerability_score).toFixed(2)} / 1.00`
+                          : 'N/A'}
+                      </div>
+                    </div>
                     <div className="selected-pano-chip">
                       {selectedSegment.nearestPanorama
                         ? `${Math.round(selectedSegment.nearestPanorama.distanceMeters)} m to panorama`
@@ -817,6 +1206,22 @@ export default function App() {
                       <div className="detail-value">{selectedSegment.material || 'N/A'}</div>
                     </div>
 
+                    <div className="detail-item">
+                      <div className="detail-label">Network Vulnerability</div>
+                      <div className="detail-value">
+                        {selectedNetworkVulnerability
+                          ? `${Number(selectedNetworkVulnerability.vulnerability_score).toFixed(2)} / 1.00`
+                          : 'N/A'}
+                      </div>
+                    </div>
+
+                    <div className="detail-item">
+                      <div className="detail-label">Risk Cluster</div>
+                      <div className="detail-value">
+                        {selectedNetworkVulnerability?.cluster_id ?? 'N/A'}
+                      </div>
+                    </div>
+
                     <div className="detail-item span-2">
                       <div className="detail-label">Clicked Location</div>
                       <div className="detail-value mono">
@@ -826,6 +1231,45 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+
+                  <details className="network-intelligence" open>
+                    <summary>Network Intelligence</summary>
+                    {!selectedNetworkVulnerability && (
+                      <div className="network-intel-empty">No vulnerability result for this segment yet.</div>
+                    )}
+                    {selectedNetworkVulnerability && (
+                      <div className="detail-grid detail-grid-5">
+                        <div className="detail-item">
+                          <div className="detail-label">Vulnerability Score</div>
+                          <div className="detail-value">{`${Number(selectedNetworkVulnerability.vulnerability_score).toFixed(2)} / 1.00`}</div>
+                        </div>
+                        <div className="detail-item">
+                          <div className="detail-label">Cluster ID</div>
+                          <div className="detail-value">{selectedNetworkVulnerability.cluster_id ?? 'N/A'}</div>
+                        </div>
+                        <div className="detail-item">
+                          <div className="detail-label">Cluster Size</div>
+                          <div className="detail-value">
+                            {selectedNetworkVulnerability.cluster_size ??
+                              effectiveVulnerabilityClusterMeta[String(selectedNetworkVulnerability.cluster_id)]?.clusterSize ??
+                              0}{' '}
+                            segments
+                          </div>
+                        </div>
+                        <div className="detail-item">
+                          <div className="detail-label">Avg Cluster PCI</div>
+                          <div className="detail-value">
+                            {Number(
+                              selectedNetworkVulnerability.avg_cluster_pci ??
+                                selectedNetworkVulnerability.cluster_avg_pci ??
+                                effectiveVulnerabilityClusterMeta[String(selectedNetworkVulnerability.cluster_id)]?.avgClusterPci ??
+                                0
+                            ).toFixed(0)}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </details>
 
                   <div className="selected-footer">
                     {selectedSegment.nearestPanorama ? (
@@ -951,6 +1395,23 @@ export default function App() {
                 )
               })}
             </div>
+            {showNetworkVulnerability && (
+              <div className="legend-list subtle network-legend">
+                <div className="network-legend-title">Network Vulnerability (0.00 - 1.00)</div>
+                <div className="network-legend-row">
+                  <span className="network-dot low" />
+                  <span>Low (dark blue)</span>
+                </div>
+                <div className="network-legend-row">
+                  <span className="network-dot medium" />
+                  <span>Medium (purple)</span>
+                </div>
+                <div className="network-legend-row">
+                  <span className="network-dot high" />
+                  <span>High (maroon)</span>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -984,6 +1445,14 @@ export default function App() {
               data={visibleGeoJson}
               style={styleFeature}
               onEachFeature={onEachFeature}
+            />
+          )}
+          {vulnerabilityOverlayGeoJson && (
+            <GeoJSON
+              key={`${viewMode}-${basemapMode}-${legendSignature}-network-vulnerability`}
+              data={vulnerabilityOverlayGeoJson}
+              style={vulnerabilityOverlayStyle}
+              interactive={false}
             />
           )}
         </MapContainer>
